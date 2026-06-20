@@ -1,0 +1,8 @@
+﻿.env
+venv/
+__pycache__/
+db.sqlite3
+law.json
+ai_models/laws_index.faiss
+*.mp3
+*.wav
