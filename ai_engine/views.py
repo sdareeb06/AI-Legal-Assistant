@@ -58,7 +58,7 @@ def try_pytesseract(pdf_bytes):
     try:
         import pytesseract
         # Windows pe uncomment karo:
-        # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+        pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
         doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
         text = ""
@@ -68,7 +68,7 @@ def try_pytesseract(pdf_bytes):
             if page_num >= 1: 
                 break
                 
-            mat = fitz.Matrix(2.0, 2.0)  # 144 DPI
+            mat = fitz.Matrix(1.0, 1.0)  # 144 DPI
             pix = page.get_pixmap(matrix=mat)
             img = PIL.Image.open(io.BytesIO(pix.tobytes("png")))
 
@@ -187,6 +187,8 @@ def extract_text_from_pdf(file_obj):
 # ─────────────────────────────────────────────────────────
 # FIR Analysis View
 # ─────────────────────────────────────────────────────────
+import time # File ke top pe agar nahi hai to daal lein
+
 @csrf_exempt
 def analyze_fir(request):
     if request.method != 'POST':
@@ -203,33 +205,33 @@ def analyze_fir(request):
             if not uploaded_file:
                 return JsonResponse({'status': 'error', 'message': 'Koi file nahi mili.'}, status=400)
 
-            print(f"[FIR] File: {uploaded_file.name} | {uploaded_file.size} bytes")
+            print(f"\n[FIR] File: {uploaded_file.name} | {uploaded_file.size} bytes")
 
+            # --- TIME TRACKER 1: EXTRACTION ---
+            t1 = time.time()
             extracted_text = extract_text_from_pdf(uploaded_file)
+            print(f"🚀 EXTRACTION TIME: {time.time() - t1:.2f} seconds")
 
-            # ── Debug: terminal mein text ka sample print karo ──
-            print(f"[FIR] Extracted sample:\n{extracted_text[:300]}\n")
-
-            # ── AI: FIR summary ──
             ai_query = f"""Tu ek Pakistani Legal AI assistant hai. Neeche ek FIR ka mazmoon hai.
-
 In cheezoon ko nikaal kar bullet points mein batao:
 - FIR Number
 - Tareekh (Date)
 - Police Station ka naam
-- Lagu dhaaraen (Sections, e.g. 302, 324 PPC)
+- Lagu dhaaraen (Sections)
 - Mukhtasir waqia (2-3 lines)
-- Mulzim ka naam (agar likha ho)
 
 FIR Mazmoon:
 {extracted_text[:3000]}
 
 Jawab Urdu mein do aur akhir mein poochho: "Kya aap mujhe aur kuch batana chahte hain ya seedha legal analysis chahiye?"
-"""
+"""         
+            # --- TIME TRACKER 2: AI (FAISS + GROQ) ---
+            t2 = time.time()
             result   = generate_legal_advice(ai_query, role="victim")
+            print(f"⚡ AI & GROQ TIME: {time.time() - t2:.2f} seconds")
+
             ai_reply = result.get('advice', 'FIR mil gayi, mujhe batayein kya karna hai.')
 
-            # FIX: Frontend ko ai_advice chahiye, ai_message nahi
             return JsonResponse({
                 'status':         'success',
                 'step':           0,
@@ -239,7 +241,8 @@ Jawab Urdu mein do aur akhir mein poochho: "Kya aap mujhe aur kuch batana chahte
                 'extracted_text': extracted_text,
                 'char_count':     len(extracted_text),  
             })
-
+            
+        # ... (Baaki step 1 aur step 2 ka code wese hi rahega jaise aapka pehle tha)
         # ══ STEP 1+ — Conversation ════════════════════════════
         else:
             extracted_text = request.POST.get('extracted_text', '')

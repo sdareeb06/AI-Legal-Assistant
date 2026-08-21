@@ -1,22 +1,42 @@
 import os
-os.environ['HF_HUB_OFFLINE'] = '1'
 import re
+import json
 import pickle
-import faiss
+import base64
 import numpy as np
+import faiss
+from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from groq import Groq
-import json
 from fpdf import FPDF
-import base64
 from docx import Document
 
 # ─────────────────────────────────────────────
-# 1. Groq Client Setup
+# 1. Environment & Environment Variables Setup
 # ─────────────────────────────────────────────
+# Django ke mutabiq exact root folder se .env load karna
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+env_path = os.path.join(BASE_DIR, '.env')
+load_dotenv(dotenv_path=env_path)
+
+# Hugging Face Hub secure local offline setting
+os.environ['HF_HUB_OFFLINE'] = '1'
+
+# Environment variables se keys uthana
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+
+if not GROQ_API_KEY:
+    raise ValueError(
+        f"\n\n🚨 ERROR: GROQ_API_KEY nahi mili!\n"
+        f"Python is jagah par file dhoondh raha hai: {env_path}\n"
+        f"Please check karein ke .env file mojud hai aur usme sahi key saved hai.\n\n"
+    )
+
+# Groq Client Initialization
 groq_client = Groq(api_key=GROQ_API_KEY)
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "qwen/qwen3.6-27b"
+
 
 # ─────────────────────────────────────────────
 # 2. Legal-BERT & FAISS Setup
@@ -58,7 +78,6 @@ def search_relevant_laws(query, top_k=5, distance_threshold=1.2):
 def detect_language(text):
     text = text.lower().strip()
     
-    # Removed overlapping English words: 'he', 'me', 'please'
     urdu_words = [
         'hai', 'hain', 'nahi', 'nai', 'kar', 'karo', 'karna', 'kya',
         'ka', 'ki', 'ko', 'mein', 'se', 'mera', 'mere', 'meri', 'mujhe',
@@ -70,7 +89,6 @@ def detect_language(text):
     words_in_text = text.split()
     score = sum(1 for word in words_in_text if word in urdu_words)
     
-    # Check for actual Urdu/Arabic script OR if at least 2 Roman Urdu words are found
     if re.search(r'[\u0600-\u06FF]', text) or score >= 2:
         return "roman_urdu"
         
@@ -115,11 +133,10 @@ TONE: Ek samajhdar Pakistani wakeel dost ki tarah — seedha, saaf, warm.
 
 
 # ─────────────────────────────────────────────
-# 3. System Prompt — Fully Rewritten
+# 3. System Prompt Generator
 # ─────────────────────────────────────────────
 def get_system_prompt(language, role="victim", is_scoring=False, matched_laws=None):
 
-    # ── SHARED CORE RULES (Dynamic Based on Language) ────────────
     if language == "roman_urdu":
         core_rules = """
 LAAZMI QAWAID — KOI EXCEPTION NAHI:
@@ -156,7 +173,6 @@ STRICT RULES — NO EXCEPTIONS:
      "Hello! I specialize in Pakistani Law. Please share your legal concern and I will guide you fully."
 """
 
-    # ── SCORING MODE ──────────────────────────────────────────────
     if is_scoring and role == "lawyer":
         lang_label = "Roman Urdu" if language == "roman_urdu" else "English"
         return f"""You are an elite Pakistani Legal AI.
@@ -185,7 +201,6 @@ JSON FORMAT:
 }}
 """
 
-    # ── LAW CONTEXT BLOCK (For display in prompt) ─────────────────
     law_context_hint = ""
     if matched_laws:
         law_names = [f"{law['topic']}" for law in matched_laws[:3]]
@@ -194,7 +209,6 @@ JSON FORMAT:
         else:
             law_context_hint = f"\nMATCHED LAWS FROM DATABASE: {', '.join(law_names)}\nYou must reference these laws explicitly in your response.\n"
 
-    # ── LAWYER MODE ───────────────────────────────────────────────
     if role == "lawyer":
         if language == "roman_urdu":
             return f"""Aap aik experienced Pakistani wakeel ke "Co-Counsel" hain — unke sath saath kaam karte hain.
@@ -266,7 +280,6 @@ If there is anything further you would like to discuss about this case, please d
 [R-END] After the 5 headings above, write NOTHING else — no "Note:", no summary, no repeated heading. Only the closing line and stop.]
 """
 
-    # ── VICTIM MODE ───────────────────────────────────────────────
     else:
         if language == "roman_urdu":
             return f"""Aap aik pareshan insaan ki madad kar rahe hain — shayad bohot ghabra hua ho ya dara hua ho.
@@ -296,7 +309,7 @@ QANOONI HAQOOQ AUR RAHNUMAI:
 - (Relevant PPC/CrPC sections ke naam + ek line explanation — max 3 bullets)
 
 ABHI KYA KARO:
-- (Fori actionable steps — max 3 bullets, seedhe aur practical)
+- (Fori actionable steps — max 3 bullets, seedhes aur practical)
 
 ZAROORI SABOOT:
 - (Jo cheez abhi sambhalni hai — max 3 bullets)
@@ -356,11 +369,24 @@ If you have any further questions about this matter or wish to share more detail
 # ─────────────────────────────────────────────
 def generate_legal_advice(query, force_english=False, role="victim", is_scoring=False):
 
+    # --- NAYA LOGIC SHURU ---
+    # 1. Pichli chat history ko ignore karke sirf AAKHRI (latest) message nikalna
     search_query = query
-    if "Client ka Naya Message:\n" in query:
-        search_query = query.split("Client ka Naya Message:\n")[-1].strip()
+    if "Client ka Naya Message:" in query:
+        search_query = query.split("Client ka Naya Message:")[-1].strip()
+    elif "User:" in query:
+        search_query = query.split("User:")[-1].strip()
+    elif "Human:" in query:
+        search_query = query.split("Human:")[-1].strip()
+    else:
+        # Agar koi label na ho, toh text ki aakhri 2 lines ko latest message maan le
+        lines = [line.strip() for line in query.split('\n') if line.strip()]
+        if len(lines) > 0:
+            search_query = " ".join(lines[-2:])
 
+    # 2. Ab SIRF aapke latest message ki language check hogi
     language = "english" if force_english else detect_language(search_query)
+    # --- NAYA LOGIC KHATAM ---
 
     # Step B: Search & Filter Laws
     retrieved_laws = search_relevant_laws(search_query, top_k=5, distance_threshold=1.2)
@@ -370,10 +396,8 @@ def generate_legal_advice(query, force_english=False, role="victim", is_scoring=
         if not any(w in (str(law['topic']) + " " + str(law['summary'])).lower() for w in NOISE_WORDS)
     ]
 
-    # Pass matched laws INTO the system prompt so AI actively uses them
     system_prompt = get_system_prompt(language, role, is_scoring, matched_laws=filtered_laws)
 
-    # Step C: Build Context Text — Richer Format
     if not filtered_laws:
         context_text = (
             "NOTE: No direct law match found in database for this query. "
@@ -390,9 +414,7 @@ def generate_legal_advice(query, force_english=False, role="victim", is_scoring=
                 f"Relevance Score: {round((1 - law['distance']) * 100)}%\n"
             )
 
-    # Step D: User Prompt
     if is_scoring:
-        # Detect evidence keywords to hint the model
         evidence_keywords = ['cctv', 'witness', 'gawah', 'medical', 'report', 'screenshot',
                              'recording', 'document', 'dastawez', 'saboot', 'fir', 'photo',
                              'video', 'audio', 'receipt', 'proof', 'evidence', 'test', 'lab']
@@ -413,7 +435,9 @@ def generate_legal_advice(query, force_english=False, role="victim", is_scoring=
             f"Follow the format in your instructions exactly."
         )
 
-    # Step E: Groq API Call
+    # YEH NAYI LINE EXACTLY API CALL SE OOPAR AAYEGI:
+    user_prompt += "\n\nCRITICAL AI INSTRUCTION: DO NOT use <think> tags. DO NOT output your internal thinking or reasoning process. Directly output the final response starting with 'AAPKI SITUATION:'."
+
     try:
         chat_completion = groq_client.chat.completions.create(
             model=GROQ_MODEL,
@@ -421,12 +445,28 @@ def generate_legal_advice(query, force_english=False, role="victim", is_scoring=
                 {'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': user_prompt}
             ],
-            temperature=0.25,
-            max_tokens=750,
-            frequency_penalty=0.8,
-            presence_penalty=0.6
+            temperature=0.4,          
+            max_tokens=4096,          # <--- ISKO 4096 KAR DIYA HAI TA-KE JAWAB CUT NA HO
+            frequency_penalty=0.1,    
+            presence_penalty=0.1      
         )
-        advice = chat_completion.choices[0].message.content
+        # 1. Raw response get kiya
+        # 1. Raw response get kiya
+        raw_advice = chat_completion.choices[0].message.content
+        
+        # 2. THE ULTIMATE FIX: Agar <think> mojood hai toh split karke sirf end wala hissa uthao
+        if "</think>" in raw_advice:
+            advice = raw_advice.split("</think>")[-1].strip()
+        elif "<think>" in raw_advice:
+            advice = raw_advice.split("<think>")[0].strip()
+        else:
+            advice = raw_advice.strip()
+
+        # 3. Agar abhi bhi response empty hai, toh fail-safe message dedo
+        if not advice:
+            advice = "System processing mein delay hai. Bara-e-meharbani apna sawal dobara bhejein."
+            
+        # 4. Markdown remove kiya
         advice = advice.replace("**", "").replace("##", "").replace("*", "")
 
         if is_scoring:
@@ -483,11 +523,6 @@ def generate_legal_advice(query, force_english=False, role="victim", is_scoring=
 # 5. Legal Draft Generator — Context-Aware
 # ─────────────────────────────────────────────
 def generate_legal_draft(draft_request_text, case_context: str = ""):
-    """
-    draft_request_text : What to draft (e.g. "bail application")
-    case_context       : Full conversation / case summary from frontend.
-    """
-
     context_block = ""
     if case_context and case_context.strip():
         context_block = f"""
@@ -511,14 +546,23 @@ STRICT RULES:
 6. Language: Formal legal English (standard Pakistani court language).
 """
 
+    # YEH NAYI LINE API CALL SE THEEK PEHLE AAYEGI:
+    prompt += "\n\nCRITICAL AI INSTRUCTION: DO NOT use <think> tags. DO NOT output your internal thinking or reasoning process. Directly output the final legal draft starting with 'IN THE COURT OF' or the appropriate legal heading."
+
     try:
         chat_completion = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=1500
+            max_tokens=4096           # <--- ISKO BHI BARAHA KAR 4096 KAR DIYA HAI
         )
-        draft_text = chat_completion.choices[0].message.content
+        # 1. Raw draft text get kiya
+        raw_draft_text = chat_completion.choices[0].message.content
+        
+        # 2. THE MAGIC FIX: <think> tags ko yahan se bhi remove kiya
+        draft_text = re.sub(r'<think>.*?</think>', '', raw_draft_text, flags=re.DOTALL).strip()
+        
+        # 3. Markdown remove kiya
         draft_text = draft_text.replace("**", "").replace("##", "").replace("*", "")
 
         doc = Document()
